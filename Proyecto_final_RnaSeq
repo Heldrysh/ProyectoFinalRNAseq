@@ -1,0 +1,207 @@
+---
+title: "Proyecto_collado"
+author: "Diego Montes Gabriel"
+date: "11/2/2022"
+output: html_document
+---
+#Identification of miRNA-mRNA regulatory network for Human Atrial Aging [mRNA]
+```{r}
+library(recount3)
+```
+```{r}
+human_projects <- available_projects()
+```
+
+```{r}
+proj_info <- subset(
+    human_projects,
+    project == "SRP220466" & project_type == "data_sources"
+)
+rse_gene_SRP220466 <- create_rse(proj_info)
+```
+```{r}
+## uso de compute_read_counts(). para convertir las cuentas de nuleotido a cuentas por lectura
+assay(rse_gene_SRP220466, "counts") <- compute_read_counts(rse_gene_SRP220466)
+```
+```{r}
+#Se realiza una expansion de los atributos SRA 
+rse_gene_SRP220466 <- expand_sra_attributes(rse_gene_SRP220466)
+
+colData(rse_gene_SRP220466)[
+    ,
+    grepl("^sra_attribute", colnames(colData(rse_gene_SRP220466)))
+]
+```
+```{r}
+#Para la realizacion de este analisis es necesario un cambio de formato 
+#Con esto podremos realizar los trabajos estadisticos
+rse_gene_SRP220466$sra_attribute.age <- as.numeric(rse_gene_SRP220466$sra_attribute.age)
+rse_gene_SRP220466$sra_attribute.gender <- as.factor(rse_gene_SRP220466$sra_attribute.gender)
+rse_gene_SRP220466$sra_attribute.source_name <- as.factor(rse_gene_SRP220466$sra_attribute.source_name)
+rse_gene_SRP220466$sra_attribute.surgical_procedure <- as.factor(rse_gene_SRP220466$sra_attribute.surgical_procedure)
+```
+
+*Una vez realizado el cambio de formato podemos seguir con la actividad 
+```{r}
+#Obtenemos el resumen de las variables de interes
+summary(as.data.frame(colData(rse_gene_SRP220466)[
+    ,
+    grepl("^sra_attribute.[age|gender|source_name|surgical_procedure]", colnames(colData(rse_gene_SRP220466)))
+]))
+```
+
+```{r}
+#Generamos 2 grupos diferenciados por su edad, estos seran "mayores a 50 años" y "menores a 50 años" 
+rse_gene_SRP220466$menor50 <- factor(ifelse(rse_gene_SRP220466$sra_attribute.age < 50, "menor50", "mayor50"))
+table(rse_gene_SRP220466$menor50)
+```
+
+```{r}
+# Se ingresa el numero de fragmentos, incluidos los mapeadores multiples, asignados por featureCountsven un gen
+# entre el numero total de entrada de fragmentos de mapeo exclusivo a featureCounts
+rse_gene_SRP220466$assigned_gene_prop <- rse_gene_SRP220466$recount_qc.gene_fc_count_all.assigned / rse_gene_SRP220466$recount_qc.gene_fc_count_all.total
+
+```
+```{r}
+with(colData(rse_gene_SRP220466), tapply(assigned_gene_prop, menor50, summary))
+
+```
+
+```{r}
+# Se guarda el objeto para acotar y tambien en caso de errores
+rse_gene_SRP220466_unfiltered <- rse_gene_SRP220466
+# Generamos un histograma que nos muestre la frecuencia de cada
+hist(rse_gene_SRP220466$assigned_gene_prop)
+```
+
+```{r}
+#Obtenemos los menores a 0.66
+#Ademas los que son menores a 0.66 se categorizan como falsos
+table(rse_gene_SRP220466$assigned_gene_prop < 0.66)
+```
+```{r}
+# Eliminamos los menores a 0.66
+rse_gene_SRP220466 <- rse_gene_SRP220466[, rse_gene_SRP220466$assigned_gene_prop > 0.66]
+
+gene_means <- rowMeans(assay(rse_gene_SRP220466, "counts"))
+#Mostramos los genes de interes
+summary(gene_means)
+
+```
+
+```{r}
+# Se eliminan genes que no superen el 0.1
+rse_gene_SRP220466 <- rse_gene_SRP220466[gene_means > 0.1, ]
+# Obtenemos las dimensiones finales
+dim(rse_gene_SRP220466)
+```
+
+
+```{r}
+# Obtenemos el porcentaje de genes que se han retenido
+round(nrow(rse_gene_SRP220466) / nrow(rse_gene_SRP220466_unfiltered) * 100, 2)
+
+```
+
+```{r}
+#Se normalizan los datos
+library("edgeR")
+```
+
+```{r}
+dge <- DGEList(
+    counts = assay(rse_gene_SRP220466, "counts"),
+    genes = rowData(rse_gene_SRP220466)
+)
+dge <- calcNormFactors(dge)
+```
+
+```{r}
+# Analizamos los datos usados para el desarrollo del proyecto 
+library("ggplot2")
+ggplot(as.data.frame(colData(rse_gene_SRP220466)), aes(y = assigned_gene_prop, x = menor50)) +
+    geom_boxplot() +
+    theme_bw(base_size = 20) +
+    ylab("Proporcion de genes asigandos") +
+    xlab("Grupo de edad")
+```
+
+*Se observa que los menores a 50 se concentran en rangos mas bajos en comparacion con los mayores a 50*
+
+```{r}
+#Generamos un modelo nuevo para analizar más datos
+mod <- model.matrix(~ menor50 + sra_attribute.age + sra_attribute.gender + assigned_gene_prop,
+    data = colData(rse_gene_SRP220466)
+)
+colnames(mod)
+```
+
+```{r}
+#Usamos limma para analizar la expresion diferencial
+library("limma")
+vGene <- voom(dge, mod, plot = TRUE)
+
+```
+*Se observa que la representacion en este modelo es muy buena, sin embargo aun hay datos que exceden los limites, por lo que podemos seguir depurando en busqueda de mejores resutados*
+
+```{r}
+# Con eBayes se calculan estadisticas empiricas de Bayes para expresion diferencial y con lmFit se ajusta el modelo lineal para cada gen dada una serie de matrices 
+eb_results <- eBayes(lmFit(vGene))
+
+de_results <- topTable(
+    eb_results,
+    coef = 2,
+    number = nrow(rse_gene_SRP220466),
+    sort.by = "none"
+)
+dim(de_results)
+```
+
+```{r}
+#Se visualizan los resultados 
+head(de_results)
+```
+
+```{r}
+#Se visualizan los datos de manera estadistica 
+plotMA(eb_results, coef = 2)
+```
+
+*Como podemos observar los valoren no se alejan tanto del 0, por lo que los resultados son buenos*
+
+
+```{r}
+#Realizamos un mapeo por volcano plot
+volcanoplot(eb_results, coef = 2, highlight = 3, names = de_results$gene_name)
+```
+
+*En este caso observamos que hay más de 2 genes que deberian ser considerados importantes para nuestro estudio*
+´
+```{r}
+#Se extraen los valores de los genes que nos interesan
+exprs_heatmap <- vGene$E[rank(de_results$adj.P.Val) <= 60, ]
+
+#Generamos una tabla de informacion de ls muestras, ademas cambiamos los nombres para hacerlos mas intuitivos 
+df <- as.data.frame(colData(rse_gene_SRP220466)[, c("menor50", "sra_attribute.age", "sra_attribute.gender")])
+colnames(df) <- c("AgeGroup", "age", "gender")
+
+#Realizamos un pheatmap para observar esta informacion 
+library("pheatmap")
+pheatmap(
+    exprs_heatmap,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_rownames = FALSE,
+    show_colnames = FALSE,
+    annotation_col = df
+)
+```
+
+*Observamos que las concentraciones en las personas menores de 50 son menores*
+
+##Conclusiones
+En cuanto los datos analizados, podemos concluir que el padecimiento es notoriamente mas frecuente dentro de las personas que superan los 50 años, quiza de poder analizar con mayor detenimiento los datos podríamos determinar la edad precisa en la que el padecimiento comienza a aparecer. También nos es posible visualizar que esto es mucho más frecuente en hombres de lo que lo es en mujeres. Esto sería todo del lado de los datos que se han analizado para el desarrollo de este proyecto. 
+
+*Ahora en cuanto la realización de esta actividad*
+Ha sido una tarea ardua desde la complicada instalación de recount3, hasta un reinicio en mi markdown que no me ha permitido cargar las graficas, sin embargo ha sido algo bastante interesante aprender sobre la depuración, obtención y visualización de datos; sin duda todo lo realizado para este proyecto sería mucho más complicado de no tener el apoyo previo del sinfín de personas que han desarrollado las librerias, el progreso de la ciencia es posible gracias al aporte y el deseo de compartir. 
+Ha sido tan sólo el inicio del manejo de datos (al menos para mí), pero me entusiasma este mismo hecho, que tan sólo es el principio. 
